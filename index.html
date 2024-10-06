@@ -1,0 +1,330 @@
+<!doctype html>
+<html>
+<head>
+    <title>WebSocket Chat with WebRTC</title>
+    <style type="text/css">
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: "Arial", sans-serif; background-color: #f0f0f0; }
+        .chat-container { display: flex; height: 100vh; }
+        .sidebar { width: 300px; background-color: #075e54; color: white; padding: 20px; overflow-y: auto; }
+        .main-chat { flex: 1; display: flex; flex-direction: column; }
+        .chat-header { padding: 10px; background-color: #128C7E; color: white; text-align: center; }
+        .messages { flex: 1; overflow-y: auto; padding: 20px; background-color: #e5ddd5; }
+        .message { margin-bottom: 15px; max-width: 70%; padding: 10px; border-radius: 8px; clear: both; }
+        .message p { margin-bottom: 5px; }
+        .message-time { font-size: 0.8em; color: #999; display: block; margin-top: 5px; }
+        .sent { float: right; background-color: #dcf8c6; border-radius: 8px 0 8px 8px; }
+        .received { float: left; background-color: #ffffff; border-radius: 0 8px 8px 8px; }
+        .chat-input { padding: 10px; background-color: #f0f0f0; display: flex; }
+        .chat-input input { flex: 1; padding: 10px; border-radius: 30px; border: 1px solid #ccc; margin-right: 10px; }
+        .chat-input button { padding: 10px; border-radius: 30px; background-color: #128C7E; color: white; border: none; cursor: pointer; }
+        .sidebar h2 { margin-top: 20px; }
+        .sidebar ul { list-style-type: none; padding-left: 0; }
+        .sidebar li { cursor: pointer; padding: 5px 0; }
+        .sidebar li:hover { text-decoration: underline; }
+        .sidebar input, .sidebar button { width: 100%; margin-top: 10px; padding: 5px; }
+        .notification { 
+            position: fixed; 
+            top: 20px; 
+            right: 20px; 
+            background-color: #128C7E; 
+            color: white; 
+            padding: 10px; 
+            border-radius: 5px; 
+            display: none;
+        }
+        .video-container { display: flex; flex-wrap: wrap; }
+        .video-wrapper { margin: 10px; }
+        video { width: 300px; height: 225px; background-color: #000; }
+        .call-buttons { margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="sidebar">
+            <h2>Users</h2>
+            <ul id="user-list"></ul>
+            <h2>Rooms</h2>
+            <ul id="room-list"></ul>
+            <input type="text" id="search-query" placeholder="Search users or rooms..."/>
+            <button id="search-button">Search</button>
+            <input type="text" id="room-name" placeholder="Enter room name..."/>
+            <button id="create-room-button">Create Room</button>
+        </div>
+        <div class="main-chat">
+            <div class="chat-header" id="chat-header">
+                <h2>Welcome to Chat!</h2>
+            </div>
+            <div class="messages" id="messages"></div>
+            <div class="video-container" id="video-container"></div>
+            <div class="call-buttons">
+                <button id="start-call-button" style="display: none;">Start Call</button>
+                <button id="end-call-button" style="display: none;">End Call</button>
+            </div>
+            <div class="chat-input">
+                <input type="text" id="chat-input" placeholder="Type a message..." />
+                <button id="send-button">Send</button>
+            </div>
+        </div>
+    </div>
+    <div id="notification" class="notification"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/simple-peer/9.11.1/simplepeer.min.js"></script>
+    <script>
+        let socket;
+        let currentRecipient = null;
+        let isRoom = false;
+        const username = prompt("Enter your username");
+        if (!username) {
+            alert("Username is required");
+            window.location.reload();
+        }
+
+        let peers = {};
+        let localStream;
+
+        document.addEventListener("DOMContentLoaded", () => {
+            connectWebSocket();
+            document.getElementById("send-button").onclick = sendMessage;
+            document.getElementById("search-button").onclick = search;
+            document.getElementById("create-room-button").onclick = createRoom;
+            document.getElementById("chat-input").addEventListener("keypress", function(event) {
+                if (event.key === "Enter") {
+                    sendMessage();
+                }
+            });
+            document.getElementById("start-call-button").onclick = startCall;
+            document.getElementById("end-call-button").onclick = endCall;
+        });
+
+        function connectWebSocket() {
+            socket = new WebSocket(`ws://${window.location.host}/ws?username=${username}`);
+
+            socket.onmessage = function(event) {
+                const response = JSON.parse(event.data);
+                if (response.type === "Chat") {
+                    displayMessage(response);
+                } else if (response.type === "New User" || response.type === "Leave") {
+                    showNotification(response.message);
+                    updateUserList();
+                    updateRoomList();
+                } else if (response.type === "webrtc_signal") {
+                    handleWebRTCSignal(response);
+                } else if (response.type === "start_room_call") {
+                    handleStartRoomCall(response);
+                } else if (response.type === "end_room_call") {
+                    handleEndRoomCall(response);
+                }
+            };
+        }
+
+        function sendMessage() {
+            const message = document.getElementById("chat-input").value;
+            if (currentRecipient && message) {
+                socket.send(JSON.stringify({
+                    type: isRoom ? "room" : "direct",
+                    to: currentRecipient,
+                    message: message
+                }));
+                displayMessage({ from: username, message: message });
+                document.getElementById("chat-input").value = "";
+            } else {
+                showNotification("Please select a recipient or room first.");
+            }
+        }
+
+        function displayMessage(response) {
+            const messageContainer = document.getElementById("messages");
+            const messageElement = document.createElement("div");
+            messageElement.className = "message " + (response.from === username ? "sent" : "received");
+            messageElement.innerHTML = `<p>${response.from}: ${response.message}</p>`;
+            messageElement.innerHTML += `<span class="message-time">${new Date().toLocaleTimeString()}</span>`;
+            messageContainer.appendChild(messageElement);
+            messageContainer.scrollTop = messageContainer.scrollHeight;
+        }
+
+        function search() {
+            const query = document.getElementById("search-query").value;
+            const type = prompt("Search for 'user' or 'room'");
+            fetch(`/search?q=${query}&type=${type}`)
+                .then(response => response.json())
+                .then(results => {
+                    const list = type === "user" ? "user-list" : "room-list";
+                    updateList(list, results);
+                    if (results.length === 1) {
+                        selectRecipient(results[0], type === "room");
+                    }
+                });
+        }
+
+        function updateList(listId, items) {
+            const ul = document.getElementById(listId);
+            ul.innerHTML = "";
+            items.forEach(item => {
+                const li = document.createElement("li");
+                li.textContent = item;
+                li.onclick = () => selectRecipient(item, listId === "room-list");
+                ul.appendChild(li);
+            });
+        }
+
+        function selectRecipient(recipient, room) {
+            currentRecipient = recipient;
+            isRoom = room;
+            document.getElementById("chat-header").innerHTML = `<h2>Chat with: ${recipient}</h2>`;
+            document.getElementById("messages").innerHTML = "";
+            if (room) {
+                socket.send(JSON.stringify({ type: "join", to: recipient }));
+                showNotification(`You've joined the room: ${recipient}`);
+            } else {
+                showNotification(`You've started a chat with ${recipient}`);
+            }
+            document.getElementById("chat-input").disabled = false;
+            document.getElementById("start-call-button").style.display = "inline-block";
+            document.getElementById("end-call-button").style.display = "none";
+        }
+
+        function createRoom() {
+            const roomName = document.getElementById("room-name").value;
+            fetch('/create', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ type: "room", name: roomName })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.message) {
+                    showNotification(data.message);
+                    updateRoomList();
+                    document.getElementById("room-name").value = "";
+                } else {
+                    showNotification(data.error);
+                }
+            });
+        }
+
+        function updateUserList() {
+            fetch('/search?type=user')
+                .then(response => response.json())
+                .then(users => updateList('user-list', users));
+        }
+
+        function updateRoomList() {
+            fetch('/search?type=room')
+                .then(response => response.json())
+                .then(rooms => updateList('room-list', rooms));
+        }
+
+        function showNotification(message) {
+            const notification = document.getElementById('notification');
+            notification.textContent = message;
+            notification.style.display = 'block';
+            setTimeout(() => {
+                notification.style.display = 'none';
+            }, 3000);
+        }
+
+        async function startCall() {
+            try {
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                addVideoStream(username, localStream);
+                
+                if (isRoom) {
+                    socket.send(JSON.stringify({ type: "start_room_call", to: currentRecipient }));
+                } else {
+                    createPeerConnection(currentRecipient, true);
+                }
+                
+                document.getElementById("start-call-button").style.display = "none";
+                document.getElementById("end-call-button").style.display = "inline-block";
+            } catch (err) {
+                console.error("Error accessing media devices:", err);
+            }
+        }
+
+        function endCall() {
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+            }
+            
+            Object.values(peers).forEach(peer => peer.destroy());
+            peers = {};
+            
+            document.getElementById("video-container").innerHTML = "";
+            document.getElementById("start-call-button").style.display = "inline-block";
+            document.getElementById("end-call-button").style.display = "none";
+            
+            if (isRoom) {
+                socket.send(JSON.stringify({ type: "end_room_call", to: currentRecipient }));
+            } else {
+                socket.send(JSON.stringify({ type: "end_call", to: currentRecipient }));
+            }
+        }
+
+        function createPeerConnection(peerId, initiator = false) {
+            const peer = new SimplePeer({
+                initiator: initiator,
+                stream: localStream,
+                trickle: false
+            });
+
+            peer.on("signal", data => {
+                socket.send(JSON.stringify({
+                    type: "webrtc_signal",
+                    to: peerId,
+                    signal: data
+                }));
+            });
+
+            peer.on("stream", stream => {
+                addVideoStream(peerId, stream);
+            });
+
+            peers[peerId] = peer;
+            return peer;
+        }
+
+        function addVideoStream(peerId, stream) {
+            const videoContainer = document.getElementById("video-container");
+            const videoWrapper = document.createElement("div");
+            videoWrapper.className = "video-wrapper";
+            const video = document.createElement("video");
+            video.srcObject = stream;
+            video.autoplay = true;
+            video.playsinline = true;
+            if (peerId === username) {
+                video.muted = true;
+            }
+            const label = document.createElement("div");
+            label.textContent = peerId;
+            videoWrapper.appendChild(video);
+            videoWrapper.appendChild(label);
+            videoContainer.appendChild(videoWrapper);
+        }
+
+        function handleWebRTCSignal(response) {
+            const { from, signal } = response;
+            if (!peers[from]) {
+                peers[from] = createPeerConnection(from);
+            }
+            peers[from].signal(signal);
+        }
+
+        function handleStartRoomCall(response) {
+            if (confirm(`${response.from} is starting a call in the room. Join?`)) {
+                startCall();
+            }
+        }
+
+        function handleEndRoomCall(response) {
+            showNotification(`${response.from} ended the call in the room.`);
+            endCall();
+        }
+
+        // Initially disable chat input until a recipient is selected
+        document.getElementById("chat-input").disabled = true;
+    </script>
+</body>
+</html>
